@@ -1,154 +1,119 @@
-# DomainHealthChecker.ps1
-# Requires Active Directory Module and Administrator privileges
+# Domain System Health Audit Script
+# Generates HTML report with dropdowns and system status
 
-param(
-    [switch]$IncludeWorkstations,
-    [int]$PortCheck = 5985,
-    [int]$TimeoutSeconds = 30
-)
+$reportPath = "$env:USERPROFILE\Documents\DomainHealthReport.html"
+$systems = Get-ADComputer -Filter * | Select-Object -ExpandProperty Name
 
-$reportPath = "$PSScriptRoot\DomainHealthReport_$(Get-Date -Format 'yyyyMMddHHmm').html"
-$computers = Get-ADComputer -Filter * -Properties OperatingSystem, IPv4Address, LastLogonDate | 
-    Where-Object { ($_.OperatingSystem -like "*Server*") -or $IncludeWorkstations }
-
-$style = @"
-<style>
-    body { font-family: Segoe UI, Arial, sans-serif; margin: 20px; }
-    table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
-    th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-    th { background-color: #f8f9fa; font-weight: 600; }
-    .pass { background-color: #d4edda; color: #155724; }
-    .warn { background-color: #fff3cd; color: #856404; }
-    .fail { background-color: #f8d7da; color: #721c24; }
-    .info { background-color: #d1ecf1; color: #0c5460; }
-</style>
-"@
-
-$report = foreach ($computer in $computers) {
-    $system = [PSCustomObject]@{
-        ComputerName      = $computer.Name
-        IPAddress         = $computer.IPv4Address
-        Status            = "Offline"
-        ConnectivityType  = "N/A"
-        OSDriveFree       = "N/A"
-        NTPStatus         = "N/A"
-        NTPOffset         = "N/A"
-        KerberosTickets   = "N/A"
-        LastBootTime      = "N/A"
-        PSRemoting        = "Disabled"
-        LastLogon         = $computer.LastLogonDate
-    }
-
-    # Enhanced connectivity check
-    $icmpStatus = $null
-    $tcpStatus = $null
-    
+$reportData = @()
+foreach ($system in $systems) {
     try {
-        # ICMP check with error handling
-        $icmpStatus = Test-Connection -ComputerName $system.ComputerName -Count 1 -Quiet -ErrorAction Stop
+        $cimSession = New-CimSession -ComputerName $system -ErrorAction Stop
+        
+        # System Information
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -CimSession $cimSession
+        $disks = Get-CimInstance -ClassName Win32_LogicalDisk -CimSession $cimSession | 
+            Where-Object {$_.DriveType -eq 3} |
+            Select-Object DeviceID, Size, FreeSpace,
+                @{Name="UsedGB";Expression={[math]::Round(($_.Size - $_.FreeSpace)/1GB,2)}},
+                @{Name="FreeGB";Expression={[math]::Round($_.FreeSpace/1GB,2)}}
+        
+        # Security Checks
+        $kerberosConfig = Invoke-Command -ComputerName $system -ScriptBlock {
+            @{
+                KerberosEnabled = (Get-Item WSMan:\localhost\Service\Auth\Kerberos).Value
+                AllowUnencrypted = (Get-Item WSMan:\localhost\Service\AllowUnencrypted).Value
+            }
+        }
+        
+        # Last User Check
+        $lastUser = Get-ChildItem "\\$system\c$\Users" -ErrorAction SilentlyContinue | 
+            Sort-Object LastWriteTime -Descending | 
+            Select-Object -First 1 Name, LastWriteTime
+
+        # Best Practice Checks
+        $bestPractices = [PSCustomObject]@{
+            PendingReboot = Test-PendingReboot -ComputerName $system
+            WindowsUpdateStatus = (Get-Service -Name wuauserv -ComputerName $system).Status
+            FirewallEnabled = (Get-NetFirewallProfile -PolicyStore PersistentStore).Enabled
+        }
+
+        $reportData += [PSCustomObject]@{
+            Hostname       = $system
+            OSVersion      = $os.Caption
+            LastBootTime   = $os.LastBootUpTime
+            Disks          = $disks
+            KerberosStatus = $kerberosConfig
+            LastUser       = $lastUser
+            BestPractices  = $bestPractices
+        }
     }
     catch {
-        $icmpStatus = $false
+        Write-Warning "Unable to connect to $system"
     }
-
-    if (-not $icmpStatus) {
-        # TCP port check as fallback
-        $tcpTest = Test-NetConnection -ComputerName $system.ComputerName -Port $PortCheck -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
-        $tcpStatus = $tcpTest.TcpTestSucceeded
-    }
-
-    if ($icmpStatus -or $tcpStatus) {
-        $system.Status = "Online"
-        $system.ConnectivityType = if ($icmpStatus) { "ICMP" } else { "TCP/$PortCheck" }
-
-        $session = $null
-        try {
-            # Remote system checks
-            $session = New-PSSession -ComputerName $system.ComputerName -ErrorAction Stop -SessionOption (New-PSSessionOption -IdleTimeout ($TimeoutSeconds * 1000))
-            $system.PSRemoting = "Enabled"
-
-            # Drive space check
-            $osDrive = Invoke-Command -Session $session -ScriptBlock {
-                Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
-            } -ErrorAction Stop
-            
-            if ($osDrive) {
-                $system.OSDriveFree = "{0:N1}% ({1:N1}GB free)" -f 
-                    ($osDrive.FreeSpace / $osDrive.Size * 100),
-                    ($osDrive.FreeSpace / 1GB)
-            }
-
-            # NTP check
-            $ntpStatus = Invoke-Command -Session $session -ScriptBlock {
-                $service = Get-Service W32Time -ErrorAction SilentlyContinue
-                $config = w32tm /query /status
-                return [PSCustomObject]@{
-                    ServiceStatus = $service.Status
-                    NTPOffset     = ($config -match '^Phase Offset:' -split ':\s+')[1]
-                    Source        = ($config -match '^Source:' -split ':\s+')[1]
-                }
-            } -ErrorAction SilentlyContinue
-            
-            if ($ntpStatus) {
-                $system.NTPStatus = $ntpStatus.ServiceStatus
-                $system.NTPOffset = $ntpStatus.NTPOffset
-            }
-
-            # Kerberos check
-            $kerberos = Invoke-Command -Session $session -ScriptBlock {
-                Get-WinEvent -FilterHashtable @{
-                    LogName = 'System'
-                    ID = 16,17,18
-                } -MaxEvents 1 -ErrorAction SilentlyContinue
-            }
-            
-            $system.KerberosTickets = if ($kerberos) { "Issues detected" } else { "Normal" }
-
-            # Uptime check
-            $lastBoot = Invoke-Command -Session $session -ScriptBlock {
-                Get-CimInstance -ClassName Win32_OperatingSystem | 
-                    Select-Object -ExpandProperty LastBootUpTime
-            }
-            $system.LastBootTime = $lastBoot.ToString()
-        }
-        catch {
-            $system.PSRemoting = "Access Denied"
-            Write-Warning "Error connecting to $($system.ComputerName): $_"
-        }
-        finally {
-            if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
-        }
-    }
-
-    # Output the system object
-    $system
 }
 
-# Generate HTML Report with conditional formatting
-$htmlReport = $report | ConvertTo-Html -Head $style -PreContent @"
-<h1>Domain Health Report</h1>
-<h3>Generated: $(Get-Date)</h3>
-<h4>Scanned Systems: $($report.Count)</h4>
-"@ | ForEach-Object {
-    $_ -replace '<td>Online</td>','<td class="pass">Online</td>' `
-       -replace '<td>Offline</td>','<td class="fail">Offline</td>' `
-       -replace '<td>Enabled</td>','<td class="pass">Enabled</td>' `
-       -replace '<td>Normal</td>','<td class="pass">Normal</td>' `
-       -replace '<td>Disabled</td>','<td class="fail">Disabled</td>' `
-       -replace '<td>Access Denied</td>','<td class="warn">Access Denied</td>' `
-       -replace '<td>Issues detected</td>','<td class="warn">Issues detected</td>'
+# HTML Report Generation
+$html = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Domain Systems Health Report</title>
+    <style>
+        .system-card { border: 1px solid #ddd; margin: 10px; padding: 15px; border-radius: 5px; }
+        .disk-table { margin: 10px 0; display: none; }
+        .critical { color: #dc3545; font-weight: bold; }
+        .warning { color: #ffc107; }
+        button { margin: 5px; padding: 5px 10px; }
+    </style>
+</head>
+<body>
+    <h1>Domain Systems Health Report</h1>
+    <h3>Generated: $(Get-Date)</h3>
+"@
+
+foreach ($system in $reportData) {
+    $html += @"
+    <div class="system-card">
+        <h2>$($system.Hostname)</h2>
+        <p>OS: $($system.OSVersion)</p>
+        <p>Last Boot: $($system.LastBootTime)</p>
+        
+        <button onclick="toggleDisks('$($system.Hostname)')">Show Disks</button>
+        <div id="$($system.Hostname)-disks" class="disk-table">
+            $($system.Disks | ConvertTo-Html -Fragment)
+        </div>
+
+        <h3>Security Status:</h3>
+        <ul>
+            <li>Kerberos Enabled: $($system.KerberosStatus.KerberosEnabled)</li>
+            <li>Unencrypted Allowed: <span class="$(
+                if ($system.KerberosStatus.AllowUnencrypted) {'critical'} else {'warning'}
+            )">$($system.KerberosStatus.AllowUnencrypted)</span></li>
+        </ul>
+
+        <h3>User Activity:</h3>
+        <p>Last User Profile: $($system.LastUser.Name) @ $($system.LastUser.LastWriteTime)</p>
+
+        <h3>Best Practices:</h3>
+        <ul>
+            <li>Pending Reboot: $($system.BestPractices.PendingReboot)</li>
+            <li>Windows Update Service: $($system.BestPractices.WindowsUpdateStatus)</li>
+            <li>Firewall Enabled: $($system.BestPractices.FirewallEnabled)</li>
+        </ul>
+    </div>
+"@
 }
 
-$htmlReport | Out-File $reportPath -Encoding UTF8
+$html += @"
+<script>
+    function toggleDisks(hostname) {
+        const diskDiv = document.getElementById(hostname + '-disks');
+        diskDiv.style.display = diskDiv.style.display === 'none' ? 'block' : 'none';
+    }
+</script>
+</body>
+</html>
+"@
 
-# Post-report actions
-Write-Host "`nReport generated: $reportPath" -ForegroundColor Cyan
-Write-Host "`nTroubleshooting Tips:`n" -ForegroundColor Yellow
-Write-Host "1. For systems showing 'Offline' but responding to TCP:"
-Write-Host "   - Check WinRM configuration: Test-WSMan <ComputerName>"
-Write-Host "   - Verify firewall rules: Get-NetFirewallRule -Name *WinRM*"
-Write-Host "2. For Kerberos issues:"
-Write-Host "   - Check system time synchronization"
-Write-Host "   - Validate SPN records: setspn -L <ComputerName>"
-Write-Host "3. For disk space warnings:"
-Write-Host "   - Consider cleanup or expanding storage"
+$html | Out-File -FilePath $reportPath -Force
+Write-Host "Report generated: $reportPath" -ForegroundColor Green
